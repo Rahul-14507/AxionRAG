@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & secrets
+.env
+config.env.local
+
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local vector store data directory (if persistence is enabled)
+qdrant_data/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

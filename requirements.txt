@@ -1,0 +1,19 @@
+# ── Embeddings ─────────────────────────────────────────────────────────
+transformers>=4.40.0
+torch>=2.2.0
+Pillow>=10.0.0                  # image loading for multimodal embed
+
+# ── Vector store ───────────────────────────────────────────────────────
+qdrant-client>=1.9.0            # Qdrant Vector DB: HNSW, local in-memory (temporarily commented out; fix later)
+
+# ── LLM (Groq) ─────────────────────────────────────────────────────────
+groq>=0.9.0                     # Groq Python SDK (cloud inference)
+
+# ── Core ───────────────────────────────────────────────────────────────
+numpy>=1.26.0
+
+# ── Document ingestion (ingest.py) ─────────────────────────────────────
+pypdf>=4.0.0                    # PDF text extraction
+python-docx>=1.1.0              # .docx extraction
+markdown>=3.6                   # .md stripping
+tiktoken>=0.7.0                 # token-aware chunking

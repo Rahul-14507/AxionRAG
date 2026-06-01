@@ -1,189 +1,423 @@
-# RAG + Memory + LLM Router
+# AxionRAG
 
-A production-grade RAG system with short-term memory, long-term memory, semantic caching, and an LLM router that eliminates unnecessary retrieval.
+![python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)
+![llm](https://img.shields.io/badge/LLM-llama--3.3--70b-brightgreen?style=flat-square&logo=meta&logoColor=white)
+![groq](https://img.shields.io/badge/inference-Groq-orange?style=flat-square)
+![vector db](https://img.shields.io/badge/vector_db-Qdrant-red?style=flat-square)
+![embeddings](https://img.shields.io/badge/embeddings-CLIP-purple?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
+
+**Agentic RAG with persistent memory, LLM routing, and semantic caching.**
+
+AxionRAG is a production-grade Retrieval-Augmented Generation pipeline that goes beyond naive chunk-and-retrieve. A single LLM call routes every query into one of three strategies — direct answer, single-pass retrieval, or multi-hop decomposition — while short-term and long-term memory keep responses coherent and personalised across sessions.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Stack](#stack)
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Configuration](#configuration)
+- [Usage](#usage)
+  - [Ingesting Documents](#ingesting-documents)
+  - [Querying the Pipeline](#querying-the-pipeline)
+- [LLM Calls Per Turn](#llm-calls-per-turn)
+- [API Reference](#api-reference)
+- [Tuning](#tuning)
+- [Production Deployment](#production-deployment)
+- [Contributing](#contributing)
+
+---
+
+## Features
+
+- **LLM Router** — One Groq call classifies every query as `DIRECT`, `RAG`, or `DECOMPOSE`, eliminating unnecessary retrieval on conversational and factual queries the model already knows.
+- **Semantic Cache** — Full answers are stored keyed by query embedding. Repeated or near-identical queries return instantly with zero LLM calls and zero retrieval.
+- **Short-Term Memory (STM)** — Sliding-window conversation buffer that rewrites pronouns and elliptic references into standalone queries before routing.
+- **Long-Term Memory (LTM)** — Per-user vector collection of extracted facts and preferences that personalises every response across sessions.
+- **Multi-hop Decomposition** — Complex multi-part questions are decomposed into focused sub-questions, retrieved independently, answered individually, then synthesised into a single coherent response.
+- **Multimodal Embeddings** — Both text and images are embedded via OpenAI CLIP, enabling mixed-content corpora.
+- **Zero infrastructure** — Qdrant runs in-memory by default. No Docker, no server, no external dependencies to start.
 
 ---
 
 ## Architecture
 
 ```
-User query
+User Input
     │
     ▼
-STM Query Rewriter          — resolves pronouns, makes query standalone
-    │
-    ▼
-Semantic Cache              — returns stored answer if cosine ≥ 0.92 (zero LLM on hit)
-    │ MISS
-    ▼
-LLM Router  ──────────────────────────────────────────────┐
-    │                                                      │
-    ├── DIRECT                  ├── RAG                   └── DECOMPOSE
-    │   Answer immediately      │   Single-pass retrieve       Sub-questions →
-    │   (no retrieval)          │   → LLM synthesis            per-sub retrieve →
-    │                           │                              synthesise
-    └───────────────────────────┴──────────────────────────────────┘
-                                        │
-                                        ▼
-                               LTM personalisation
-                                        │
-                                        ▼
-                               Memory write-back
-                         (cache + STM + LTM fact extraction)
+┌─────────────────────────────────┐
+│  STM Query Rewriter             │  Resolves pronouns, makes query
+│  (skipped on first turn)        │  self-contained. 1 LLM call.
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│  Semantic Cache                 │  Cosine similarity vs stored queries.
+│  threshold: 0.92, TTL: 7 days   │  Hit → return answer. 0 LLM calls.
+└───────────────┬─────────────────┘
+                │ MISS
+                ▼
+┌─────────────────────────────────┐
+│  LLM Router                     │  Single Groq call. Classifies query
+│                                 │  and acts on it simultaneously.
+└─────┬───────────┬───────────────┘
+      │           │              │
+   DIRECT        RAG         DECOMPOSE
+      │           │              │
+      │           ▼              ▼
+      │   ┌──────────────┐  ┌────────────────────────┐
+      │   │ Vector Search│  │ Generate sub-questions │
+      │   │ (Qdrant HNSW)│  │ Retrieve per-sub       │
+      │   │ top_k=5      │  │ Answer per-sub         │
+      │   └──────┬───────┘  │ Synthesise all         │
+      │          │          └───────────┬────────────┘
+      │          ▼                      │
+      │   ┌──────────────┐              │
+      │   │  Synthesise  │              │
+      │   │  (LTM + STM) │              │
+      │   └──────┬───────┘              │
+      └──────────┴──────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────┐
+│  Write-back                     │
+│  · Cache store                  │
+│  · STM update                   │
+│  · LTM fact extraction          │
+└─────────────────────────────────┘
+                 │
+                 ▼
+            Final Answer
 ```
-
-### LLM calls per turn
-
-| Path | LLM calls |
-|---|---|
-| Cache hit | 0 |
-| DIRECT | 1 (router = answer) |
-| RAG | 2 (router + synthesis) |
-| DECOMPOSE (N sub-questions) | 2+N (router + sub-answers + synthesis) |
-
-All paths include +1 for STM query rewriting on turns after the first.
 
 ---
 
 ## Stack
 
-| Layer | Tool |
-|---|---|
-| Embeddings | CLIP (`openai/clip-vit-large-patch14`) — fully local, text + image |
-| Vector DB | Qdrant (HNSW, cosine similarity) — in-memory by default |
-| LLM | Groq API — `llama-3.3-70b-versatile` |
-| Router | LLM-as-router (DIRECT / RAG / DECOMPOSE) |
-| STM | In-process sliding window (last 8 turns) |
-| LTM | Per-user TurboQuant collection (extracted facts) |
-| Cache | Semantic cache (TurboQuant, cosine ≥ 0.92, TTL 7d) |
+| Layer          | Technology                           | Notes                                                |
+| -------------- | ------------------------------------ | ---------------------------------------------------- |
+| **Embeddings** | CLIP `openai/clip-vit-large-patch14` | Text + image, 768-dim, runs locally                  |
+| **Vector DB**  | Qdrant (HNSW, cosine)                | In-memory by default; one-line swap to disk or cloud |
+| **LLM**        | Groq API — `llama-3.3-70b-versatile` | Fast cloud inference, free tier available            |
+| **Router**     | LLM-as-router                        | `DIRECT` / `RAG` / `DECOMPOSE` in one call           |
+| **STM**        | In-process sliding window            | Last 8 turns, with query rewriting                   |
+| **LTM**        | Per-user Qdrant collection           | Extracted facts, persistent cross-session            |
+| **Cache**      | Semantic cache (Qdrant)              | Cosine ≥ 0.92, TTL 7 days                            |
+
+---
+
+## Project Structure
+
+```
+AxionRAG/
+├── rag_memory_core.py   # Core pipeline — all classes, embedding, routing, memory
+├── ingest.py            # CLI tool: chunk and index documents into the pipeline
+├── example_usage.py     # 8-turn demo exercising all router paths
+├── requirements.txt     # Python dependencies
+├── config.env           # Environment variable template (copy to .env)
+└── .gitignore
+```
 
 ---
 
 ## Setup
 
-### Quick start
+### Prerequisites
+
+- Python 3.10+
+- A free [Groq API key](https://console.groq.com) — sign up, go to **API Keys → Create key**
+
+### 1. Clone and create a virtual environment
+
+```bash
+git clone https://github.com/Rahul-14507/AxionRAG.git
+cd AxionRAG
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+```
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
-cp config.env .env   # add GROQ_API_KEY
-export $(grep -v '^#' .env | xargs)
-python ingest.py --source ./your_docs --user my_user
-python example_usage.py
 ```
 
-### Detailed steps
+The CLIP model (~1.7 GB) is downloaded from HuggingFace automatically on first run and cached in `~/.cache/huggingface`.
 
-#### 1. Install dependencies
-```bash
-pip install -r requirements.txt
-```
+### 3. Configure environment variables
 
-#### 2. Set environment variables
 ```bash
 cp config.env .env
-# Edit .env — add your GROQ_API_KEY
-export $(grep -v '^#' .env | xargs)
 ```
 
-#### 3. Get a Groq API key
-Sign up free at https://console.groq.com → API Keys → Create key.
-Add it to your .env file as `GROQ_API_KEY`.
+Open `.env` and fill in your key:
 
-#### 4. Ingest documents
+```env
+GROQ_API_KEY=gsk_your_key_here
+```
+
+Load the environment:
+
 ```bash
-# Index a folder of PDFs, docx, txt, md files
-python ingest.py --source ./your_docs --user my_user
+# macOS / Linux
+export $(grep -v '^#' .env | xargs)
 
-# Index a single file
-python ingest.py --source ./manual.pdf --user my_user
-
-# Custom chunk size
-python ingest.py --source ./docs --chunk-tokens 512 --overlap-tokens 64
+# Windows PowerShell
+Get-Content .env | ForEach-Object {
+    if ($_ -match '^([^#][^=]*)=(.*)$') {
+        [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
+    }
+}
 ```
 
-#### 5. Run the demo
+### 4. Run the demo
+
 ```bash
 python example_usage.py
 ```
 
----
-
-## Files
-
-```
-rag_memory_core.py   Core pipeline — all classes and logic
-ingest.py            CLI tool to chunk and index documents
-example_usage.py     8-turn demo exercising all router paths
-requirements.txt     Python dependencies
-config.env           Environment variable template
-README.md            This file
-```
+The demo indexes 11 document chunks and runs an 8-turn conversation exercising all three router paths: `DIRECT`, `RAG`, and `DECOMPOSE`, plus an STM rewrite and a semantic cache hit.
 
 ---
 
-## Key classes
+## Configuration
+
+All parameters are controlled via environment variables or constants in `rag_memory_core.py`.
+
+| Variable              | Default                         | Description                                         |
+| --------------------- | ------------------------------- | --------------------------------------------------- |
+| `GROQ_API_KEY`        | _(required)_                    | Groq API key                                        |
+| `CLIP_MODEL_ID`       | `openai/clip-vit-large-patch14` | HuggingFace CLIP model ID                           |
+| `CACHE_SIM_THRESHOLD` | `0.92`                          | Minimum cosine similarity for a cache hit           |
+| `CACHE_TTL_SECONDS`   | `604800` (7 days)               | Cache entry lifetime                                |
+| `STM_WINDOW`          | `8`                             | Conversation turns retained in short-term memory    |
+| `LTM_TOP_K`           | `3`                             | User facts retrieved per query                      |
+| `RAG_TOP_K`           | `5`                             | Document chunks retrieved per RAG query             |
+| `SUB_RAG_TOP_K`       | `3`                             | Chunks retrieved per sub-question in DECOMPOSE path |
+| `DECOMP_MAX_SUBQ`     | `4`                             | Hard cap on sub-questions                           |
+
+---
+
+## Usage
+
+### Ingesting Documents
+
+`ingest.py` is a CLI tool that reads documents, splits them into overlapping token-aware chunks, and indexes them into the pipeline's `DocumentStore`.
+
+**Supported formats:** `.pdf`, `.docx`, `.txt`, `.md`
+
+```bash
+# Index a folder
+python ingest.py --source ./docs --user alice
+
+# Index a single file
+python ingest.py --source ./manual.pdf --user alice
+
+# Custom chunk size and overlap
+python ingest.py --source ./docs --chunk-tokens 512 --overlap-tokens 64 --user alice
+```
+
+| Flag               | Default      | Description                                     |
+| ------------------ | ------------ | ----------------------------------------------- |
+| `--source`         | _(required)_ | Path to a file or directory                     |
+| `--user`           | `default`    | User ID — controls which LTM collection is used |
+| `--chunk-tokens`   | `256`        | Target chunk size in tokens                     |
+| `--overlap-tokens` | `32`         | Overlap between consecutive chunks              |
+
+Chunks are content-addressed using an MD5 hash of `(file path + chunk index + first 64 chars)`. Re-ingesting the same file is safe and idempotent.
+
+---
+
+### Querying the Pipeline
+
+```python
+from rag_memory_core import RAGMemoryPipeline
+
+pipeline = RAGMemoryPipeline(user_id="alice")
+
+# Index some text directly
+pipeline.index("doc_001", "TurboQuant uses HNSW indexing...", metadata={"source": "docs/db.md"})
+
+# Index an image
+with open("diagram.png", "rb") as f:
+    pipeline.index_image("img_001", f.read(), caption="System architecture diagram")
+
+# Ask a question — the router, cache, STM, and LTM all fire automatically
+answer = pipeline.query("What indexing method does TurboQuant use?")
+print(answer)
+```
+
+The pipeline is stateful. Each `query()` call updates STM, extracts facts into LTM, and stores the answer in the semantic cache.
+
+---
+
+## LLM Calls Per Turn
+
+| Path                            | LLM calls | Triggered when                                                    |
+| ------------------------------- | --------- | ----------------------------------------------------------------- |
+| **Cache hit**                   | 0         | Query cosine ≥ 0.92 to a stored query                             |
+| **DIRECT**                      | 1         | Greetings, math, general knowledge — no document lookup needed    |
+| **RAG**                         | 2         | Single focused document lookup (+ 1 for STM rewrite after turn 1) |
+| **DECOMPOSE (N sub-questions)** | 2 + N     | Multi-part or comparative questions                               |
+
+The STM rewrite adds +1 LLM call on every turn after the first. It is skipped on the first turn.
+
+---
+
+## API Reference
 
 ### `RAGMemoryPipeline`
-Main entrypoint. One public method: `pipeline.query(user_input) → str`.
+
+The main entrypoint. All state is encapsulated inside a single instance.
 
 ```python
 pipeline = RAGMemoryPipeline(user_id="alice")
-pipeline.index("chunk_001", "TurboQuant uses HNSW indexing...")
-answer = pipeline.query("What indexing method does TurboQuant use?")
 ```
 
-### `LLMRouter`
-Single LLM call that classifies the query and prepares the retrieval strategy.
-Output format enforced via a strict system prompt. Falls back to RAG on parse failure.
+| Method        | Signature                                            | Description                                  |
+| ------------- | ---------------------------------------------------- | -------------------------------------------- |
+| `index`       | `(chunk_id: str, text: str, metadata: dict \| None)` | Embeds and indexes a text chunk              |
+| `index_image` | `(chunk_id: str, image_bytes: bytes, caption: str)`  | Embeds and indexes an image chunk            |
+| `query`       | `(user_input: str) → str`                            | Runs the full pipeline and returns an answer |
+
+---
 
 ### `ShortTermMemory`
-Sliding window of last N turns. `rewrite_query()` resolves pronouns before routing.
+
+Sliding-window conversation buffer.
+
+| Method                     | Description                                           |
+| -------------------------- | ----------------------------------------------------- |
+| `add(role, content)`       | Appends a turn to the buffer                          |
+| `rewrite_query(raw_query)` | Rewrites the query as a standalone question using LLM |
+| `format_for_prompt()`      | Returns formatted conversation history                |
+
+---
 
 ### `LongTermMemory`
-Per-user TurboQuant collection. Facts are extracted from every user turn and stored
-as embeddings. Retrieved at query time for personalisation.
+
+Per-user persistent fact store backed by Qdrant.
+
+| Method                            | Description                                          |
+| --------------------------------- | ---------------------------------------------------- |
+| `store_fact(fact)`                | Embeds and upserts a fact into the user's collection |
+| `retrieve(query, top_k)`          | Returns the top-k most relevant facts                |
+| `extract_and_store(user_message)` | Calls LLM to extract memorable facts from a turn     |
+
+---
 
 ### `SemanticCache`
-Stores full answers keyed by query embedding. On a hit: zero retrieval, zero LLM.
-TTL eviction prevents stale answers.
 
-### `QueryDecomposer`
-Handles the DECOMPOSE path. Retrieves independently per sub-question, answers each,
-then synthesises into one final response.
+Full-answer cache keyed by query embedding.
+
+| Method                               | Description                                                            |
+| ------------------------------------ | ---------------------------------------------------------------------- |
+| `lookup(query) → CacheEntry \| None` | Returns a cached answer if cosine ≥ threshold and entry is not expired |
+| `store(query, answer, chunk_ids)`    | Stores a new cache entry                                               |
+
+---
 
 ### `DocumentStore`
-Wraps TurboQuant for document indexing and retrieval. Supports text and image chunks
-(multimodal via CLIP).
+
+Vector store for document chunks.
+
+| Method                                                  | Description                              |
+| ------------------------------------------------------- | ---------------------------------------- |
+| `add_text(chunk_id, text, metadata)`                    | Embeds and upserts a text chunk          |
+| `add_image(chunk_id, image_bytes, caption, metadata)`   | Embeds and upserts an image chunk        |
+| `retrieve(query, top_k) → list[tuple[str, str, float]]` | Returns `[(chunk_id, text, score), ...]` |
+| `fetch(chunk_ids) → list[tuple[str, str]]`              | Fetches raw text by chunk ID             |
 
 ---
 
 ## Tuning
 
-| Parameter | Default | Effect |
-|---|---|---|
-| `CACHE_SIM_THRESHOLD` | 0.92 | Lower → more cache hits, risk stale answers |
-| `CACHE_TTL_SECONDS` | 604800 (7d) | Lower → fresher answers, lower hit rate |
-| `STM_WINDOW` | 8 | Higher → more context, longer prompts |
-| `RAG_TOP_K` | 5 | Higher → more context, higher latency |
-| `SUB_RAG_TOP_K` | 3 | Chunks per sub-question in DECOMPOSE path |
-| `DECOMP_MAX_SUBQ` | 4 | Hard cap on sub-questions |
+### Raising cache precision
+
+Increase `CACHE_SIM_THRESHOLD` (e.g. `0.95`) to only hit the cache on near-verbatim repeats. Lower it (e.g. `0.88`) for more aggressive caching on paraphrase variants.
+
+### Adjusting retrieval breadth
+
+Increase `RAG_TOP_K` for longer, more context-rich synthesis prompts. Increase `SUB_RAG_TOP_K` for deeper sub-question answers in the DECOMPOSE path. Both increase latency and token usage.
+
+### LLM temperature
+
+`llm_call()` uses `temperature=0.2` for deterministic routing, retrieval query generation, and sub-question answering. If you want more expressive final synthesis answers, add a `temperature` parameter to `_synthesise()` and pass `0.7`.
+
+### Groq rate limits
+
+The free tier allows **6,000 tokens/min** on `llama-3.3-70b-versatile`. Add exponential backoff for high-throughput use:
+
+```python
+import groq, time
+
+def llm_call_with_retry(prompt, system="", max_tokens=1024, max_attempts=4):
+    for attempt in range(max_attempts):
+        try:
+            return llm_call(prompt, system=system, max_tokens=max_tokens)
+        except groq.RateLimitError:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
+```
 
 ---
 
-## Production notes
+## Production Deployment
 
-- CLIP model (~1.7GB) is downloaded from HuggingFace on first run and cached
-  in `~/.cache/huggingface`. Set `CLIP_MODEL_ID` env var to use a different
-  CLIP variant (e.g. `openai/clip-vit-base-patch32` for lower memory usage).
-- `SemanticCache._meta` is in-process RAM — replace with Redis or SQLite for persistence across restarts.
-- `DocumentStore._chunks` is in-process RAM — replace with a database for large corpora.
-- `LongTermMemory` uses a Qdrant collection per user — fine up to ~100k users; shard beyond that.
-- Qdrant runs in-memory by default (no server needed). For persistence across
-  restarts, change `QdrantClient(":memory:")` to `QdrantClient(path="./qdrant_data")`
-  in `_get_qdrant()`. For a remote Qdrant cluster, use
-  `QdrantClient(host="localhost", port=6333)` or the Qdrant Cloud URL.
-- Groq enforces rate limits on the free tier (6000 tokens/min on llama-3.3-70b-versatile).
-  For high-throughput production use, add exponential backoff around `llm_call()`:
-  catch `groq.RateLimitError` and retry with `time.sleep(2 ** attempt)`.
-- CLIP still runs fully locally — Groq only handles LLM inference.
-- For high-throughput production use, batch the embedding calls to CLIP and run sub-question retrievals concurrently with `asyncio.gather`.
+### Qdrant persistence
+
+By default, Qdrant runs in-memory and all data is lost when the process exits. To persist data across restarts, change one line in `_get_qdrant()`:
+
+```python
+# On-disk persistence (no server required)
+_qdrant = QdrantClient(path="./qdrant_data")
+
+# Remote Qdrant server or Qdrant Cloud
+_qdrant = QdrantClient(host="localhost", port=6333)
+_qdrant = QdrantClient(url="https://your-cluster.qdrant.io", api_key="your-qdrant-key")
+```
+
+### SemanticCache persistence
+
+`SemanticCache._meta` is an in-process Python dict. For multi-process or multi-restart deployments, replace it with a Redis or SQLite-backed store keyed by the Qdrant point ID.
+
+### LongTermMemory at scale
+
+Each user gets their own Qdrant collection (`ltm_{user_id}`). This is practical up to ~100k users on a single node. For larger user bases, shard by user ID prefix or use namespaced collections on a Qdrant cluster.
+
+### Async and batching
+
+For high-throughput scenarios:
+
+- Batch Groq calls for the DECOMPOSE sub-question answer step using `asyncio.gather`.
+- Batch CLIP embedding calls for bulk document ingestion.
+- Use `AsyncQdrantClient` to avoid blocking the event loop on vector operations.
+
+### CLIP model size
+
+The default `openai/clip-vit-large-patch14` model is ~1.7 GB and uses 768-dim vectors. For lower-memory deployments, switch to `openai/clip-vit-base-patch32` (340 MB, 512-dim) by setting `CLIP_MODEL_ID=openai/clip-vit-base-patch32`. Reindex all documents after changing the model — vector dimensions must match the collection.
+
+---
+
+## Contributing
+
+1. Fork the repository and create a feature branch.
+2. Make your changes. Keep new classes and functions in `rag_memory_core.py` unless the change is a standalone CLI tool.
+3. Test against `example_usage.py` and ensure all three router paths produce sensible output.
+4. Open a pull request with a clear description of the change and why it improves the system.
+
+---
+
+## License
+
+MIT
